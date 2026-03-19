@@ -1,0 +1,675 @@
+from __future__ import annotations
+
+"""InnerBalance service watchdog and Telegram control helpers."""
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import psutil
+import requests
+from dotenv import load_dotenv
+
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+DESKTOP = Path("C:/Users/fishman-ai-server/Desktop")
+WATCHDOG_DIR = Path(__file__).resolve().parent
+AI_AGENTS_DIR = DESKTOP / "ai_agents"
+INDEX_SHORTCUT = DESKTOP / "index - Shortcut.lnk"
+REAL_AGENTS_DIR = DESKTOP / "real_agents_bot"
+BOT_NEWS_DIR = DESKTOP / "bot_news"
+MARKETING_WORKFLOW_DIR = DESKTOP / "marketing_workflow_app"
+MEDIA_WORKFLOW_DIR = DESKTOP / "media_workflow_app"
+
+load_dotenv(DESKTOP / "_config" / ".env")
+load_dotenv(AI_AGENTS_DIR / ".env", override=False)
+
+MAIN_TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+WATCHDOG_TELEGRAM_BOT_TOKEN = os.getenv("WATCHDOG_TELEGRAM_BOT_TOKEN", "").strip()
+BOT_TOKEN = WATCHDOG_TELEGRAM_BOT_TOKEN or MAIN_TELEGRAM_BOT_TOKEN
+ADMIN_ID = int(os.getenv("WATCHDOG_ADMIN_ID", os.getenv("ADMIN_ID", "165270683")))
+APPROVAL_TIMEOUT = int(os.getenv("WATCHDOG_APPROVAL_TIMEOUT", "120"))
+LISTENER_POLL_SECONDS = int(os.getenv("WATCHDOG_LISTENER_POLL_SECONDS", "2"))
+ALLOW_SHARED_TOKEN_LISTENER = os.getenv("WATCHDOG_ALLOW_SHARED_TOKEN_POLLING", "0").strip().lower() in {"1", "true", "yes"}
+MAIN_BOT_SERVICE_KEY = "ai_agents_bot"
+SHARED_TOKEN_MODE = bool(BOT_TOKEN and MAIN_TELEGRAM_BOT_TOKEN and BOT_TOKEN == MAIN_TELEGRAM_BOT_TOKEN and not WATCHDOG_TELEGRAM_BOT_TOKEN)
+
+SERVICES: list[dict[str, Any]] = [
+      {
+          "name": "Web Server (InnerBalance)",
+          "button": "Web Server",
+          "key": "web_server",
+         "check": {"type": "url", "url": "http://127.0.0.1:8000/healthz", "status_field": "ok", "status_value": "true"},
+          "restart_bat": str(AI_AGENTS_DIR / "start_web_server_only.bat"),
+          "restart_cwd": str(AI_AGENTS_DIR),
+          "restart_wait": 8,
+          "auto_restart": True,
+      },
+      {
+          "name": "Cloudflare Tunnel",
+          "button": "Cloudflare",
+          "key": "cloudflare",
+          "check": {"type": "process", "name": "cloudflared", "cmd_contains": "delivery-hsp"},
+          "restart_bat": str(AI_AGENTS_DIR / "start_cloudflare_tunnel_only.bat"),
+          "restart_cwd": str(AI_AGENTS_DIR),
+          "restart_wait": 6,
+         "auto_restart": True,
+      },
+    {
+        "name": "AI Agents Bot (Telegram)",
+        "button": "AI Bot",
+        "key": "ai_agents_bot",
+        "check": {"type": "process", "name": "python", "cwd_contains": "ai_agents", "cmd_contains": "main.py"},
+        "restart_bat": str(AI_AGENTS_DIR / "start_ai_agents_bot_only.bat"),
+        "restart_cwd": str(AI_AGENTS_DIR),
+        "restart_wait": 8,
+        "auto_restart": True,
+    },
+    {
+        "name": "Cabinet Bot (Real Agents)",
+        "button": "Cabinet",
+        "key": "real_agents_bot",
+        "check": {"type": "process", "name": "python", "cwd_contains": "real_agents_bot", "cmd_contains": "main.py"},
+        "restart_bat": str(REAL_AGENTS_DIR / "start_bot_only.bat"),
+        "restart_cwd": str(REAL_AGENTS_DIR),
+        "restart_wait": 10,
+        "auto_restart": True,
+    },
+    {
+        "name": "News Bot (bot_news)",
+        "button": "News Bot",
+        "key": "bot_news",
+        "check": {"type": "process", "name": "python", "cwd_contains": "bot_news", "cmd_contains": "main.py"},
+        "restart_bat": str(BOT_NEWS_DIR / "start_bot_only.bat"),
+        "restart_cwd": str(BOT_NEWS_DIR),
+        "restart_wait": 8,
+        "auto_restart": True,
+    },
+      {
+          "name": "Marketing Workflow App",
+          "button": "Marketing",
+          "key": "marketing_workflow",
+          "check": {"type": "url", "url": "http://127.0.0.1:8200/health", "status_field": "status", "status_value": "ok"},
+          "restart_bat": str(MARKETING_WORKFLOW_DIR / "start_api_only.bat"),
+          "restart_cwd": str(MARKETING_WORKFLOW_DIR),
+          "restart_wait": 20,
+          "auto_restart": True,
+      },
+      {
+          "name": "Media Workflow App",
+          "button": "Studio",
+          "key": "media_workflow",
+          "check": {"type": "url", "url": "http://127.0.0.1:8100/health", "status_field": "status", "status_value": "ok"},
+          "restart_bat": str(MEDIA_WORKFLOW_DIR / "run_backend_only.bat"),
+          "restart_cwd": str(MEDIA_WORKFLOW_DIR),
+          "restart_wait": 20,
+          "auto_restart": True,
+      },
+  ]
+SERVICE_MAP = {service["key"]: service for service in SERVICES}
+BOOTSTRAP_SERVICE_KEYS = [service["key"] for service in SERVICES]
+_LAST_SERVICE_UP: dict[str, bool] = {}
+
+
+def _status_icon(is_up_flag: bool) -> str:
+    return "?" if is_up_flag else "?"
+
+
+def _normalize_text(value: str | None) -> str:
+    return (value or "").lower().replace("\\", "/")
+
+
+def check_port(port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(2)
+            return sock.connect_ex(("127.0.0.1", port)) == 0
+    except Exception:
+        return False
+
+
+def check_url(url: str, status_field: str | None = None, status_value: str | None = None) -> bool:
+    try:
+        response = requests.get(url, timeout=4)
+        if response.status_code != 200:
+            return False
+        if status_field:
+            payload = response.json()
+            return str(payload.get(status_field, "")).lower() == str(status_value or "").lower()
+        return True
+    except Exception:
+        return False
+
+
+def check_process(name: str, cwd_contains: str | None = None, cmd_contains: str | None = None) -> bool:
+    name_lower = _normalize_text(name)
+    cwd_lower = _normalize_text(cwd_contains)
+    cmd_lower = _normalize_text(cmd_contains)
+
+    for proc in psutil.process_iter(["name", "cmdline"]):
+        try:
+            proc_name = _normalize_text(proc.info.get("name"))
+            cmdline = _normalize_text(" ".join(proc.info.get("cmdline") or []))
+            if name_lower and name_lower not in proc_name and name_lower not in cmdline:
+                continue
+            if cmd_lower and cmd_lower not in cmdline:
+                continue
+            if cwd_lower:
+                try:
+                    cwd = _normalize_text(proc.cwd())
+                except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                    cwd = ""
+                if cwd_lower not in cwd and cwd_lower not in cmdline:
+                    continue
+            return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+    return False
+
+
+def is_up(service: dict[str, Any]) -> bool:
+    spec = service["check"]
+    kind = spec.get("type")
+    if kind == "port":
+        return check_port(int(spec["port"]))
+    if kind == "url":
+        return check_url(spec["url"], spec.get("status_field"), spec.get("status_value"))
+    if kind == "process":
+        return check_process(spec.get("name", ""), spec.get("cwd_contains"), spec.get("cmd_contains"))
+    return False
+
+
+def collect_service_statuses() -> list[dict[str, Any]]:
+    statuses: list[dict[str, Any]] = []
+    for service in SERVICES:
+        up = is_up(service)
+        statuses.append(
+            {
+                "key": service["key"],
+                "name": service["name"],
+                "button": service.get("button", service["name"]),
+                "up": up,
+                "check": service["check"],
+                "restart_bat": service["restart_bat"],
+            }
+        )
+    return statuses
+
+
+def get_service_status(service_key: str) -> dict[str, Any] | None:
+    service = SERVICE_MAP.get(service_key)
+    if not service:
+        return None
+    return {
+        "key": service["key"],
+        "name": service["name"],
+        "button": service.get("button", service["name"]),
+        "up": is_up(service),
+        "check": service["check"],
+        "restart_bat": service["restart_bat"],
+    }
+
+
+def format_system_status_message(statuses: list[dict[str, Any]] | None = None, *, header: str = "System Status") -> str:
+    rows = statuses or collect_service_statuses()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    down_count = sum(1 for item in rows if not item["up"])
+    lines = [header, now, ""]
+    for item in rows:
+        lines.append(f"{_status_icon(item['up'])} {item['name']}")
+    lines.append("")
+    if down_count:
+        lines.append(f"Down right now: {down_count}")
+    else:
+        lines.append("All monitored services are up.")
+    return "\n".join(lines)
+
+
+def build_action_rows(statuses: list[dict[str, Any]] | None = None) -> list[list[tuple[str, str]]]:
+    rows = statuses or collect_service_statuses()
+    buttons: list[list[tuple[str, str]]] = []
+    for item in rows:
+        if not item["up"]:
+            buttons.append([(f"Start {item['button']}", f"systems_restart:{item['key']}")])
+    buttons.append([("Refresh status", "systems_refresh")])
+    return buttons
+
+
+def _build_raw_keyboard(rows: list[list[tuple[str, str]]]) -> list[list[dict[str, str]]]:
+    return [[{"text": text, "callback_data": callback} for text, callback in row] for row in rows]
+
+
+def tg_send(text: str, keyboard: list[list[dict[str, str]]] | None = None, parse_mode: str | None = None) -> int | None:
+    if not BOT_TOKEN:
+        print("[watchdog] TELEGRAM token missing; skipping Telegram send")
+        return None
+    payload: dict[str, Any] = {"chat_id": ADMIN_ID, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if keyboard:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+    try:
+        response = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=10)
+        data = response.json()
+        if data.get("ok"):
+            return data["result"]["message_id"]
+        print(f"[watchdog] Telegram send error: {data}")
+    except Exception as exc:
+        print(f"[watchdog] Telegram send failed: {exc}")
+    return None
+
+
+def tg_edit(chat_id: int, message_id: int, text: str, keyboard: list[list[dict[str, str]]] | None = None) -> None:
+    if not BOT_TOKEN:
+        return
+    payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if keyboard:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+    try:
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText", json=payload, timeout=10)
+    except Exception:
+        pass
+
+
+def tg_get_updates(offset: int | None = None, allowed_updates: list[str] | None = None) -> list[dict[str, Any]]:
+    if not BOT_TOKEN:
+        return []
+    params: dict[str, Any] = {"timeout": 10}
+    if offset is not None:
+        params["offset"] = offset
+    if allowed_updates:
+        params["allowed_updates"] = json.dumps(allowed_updates)
+    try:
+        response = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params=params, timeout=15)
+        return response.json().get("result", [])
+    except Exception:
+        return []
+
+
+def tg_answer_callback(callback_id: str, text: str = "") -> None:
+    if not BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_id, "text": text},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def get_service(service_key: str) -> dict[str, Any] | None:
+    return SERVICE_MAP.get(service_key)
+
+
+def restart_service(service: dict[str, Any], send_notifications: bool = True) -> tuple[bool, str]:
+    bat_path = Path(service["restart_bat"])
+    cwd_path = Path(service.get("restart_cwd") or DESKTOP)
+    wait_seconds = int(service.get("restart_wait", 8))
+    service_name = service["name"]
+
+    if not bat_path.exists():
+        message = f"Launcher for {service_name} was not found: {bat_path}"
+        if send_notifications:
+            tg_send(message)
+        return False, message
+
+    try:
+        startupinfo = None
+        creationflags = 0
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(
+            ["cmd", "/c", str(bat_path)],
+            cwd=str(cwd_path),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
+        )
+    except Exception as exc:
+        message = f"Failed to start {service_name}: {exc}"
+        if send_notifications:
+            tg_send(message)
+        return False, message
+
+    time.sleep(wait_seconds)
+    success = is_up(service)
+    if success:
+        message = f"{service_name} started successfully"
+    else:
+        message = f"{service_name} is still down after the restart attempt"
+    if send_notifications:
+        tg_send(message)
+    return success, message
+
+
+def restart_service_by_key(service_key: str, send_notifications: bool = True) -> tuple[bool, str]:
+    service = get_service(service_key)
+    if not service:
+        message = f"Unknown service: {service_key}"
+        if send_notifications:
+            tg_send(message)
+        return False, message
+    return restart_service(service, send_notifications=send_notifications)
+
+
+def launch_shortcut(shortcut_path: Path) -> tuple[bool, str]:
+    if not shortcut_path.exists():
+        return False, f"Shortcut was not found: {shortcut_path}"
+
+    try:
+        os.startfile(str(shortcut_path))
+        return True, f"Launched shortcut: {shortcut_path.name}"
+    except Exception as exc:
+        return False, f"Failed to launch shortcut {shortcut_path.name}: {exc}"
+
+
+def bootstrap_core_systems() -> list[str]:
+    messages: list[str] = []
+
+    for service_key in BOOTSTRAP_SERVICE_KEYS:
+        service = SERVICE_MAP.get(service_key)
+        if not service:
+            continue
+        if is_up(service):
+            messages.append(f"{service['name']} already up")
+            continue
+        ok, message = restart_service(service, send_notifications=False)
+        messages.append(message)
+        time.sleep(2 if ok else 1)
+
+    ok, message = launch_shortcut(INDEX_SHORTCUT)
+    messages.append(message)
+    if ok:
+        time.sleep(2)
+
+    return messages
+
+
+def _shared_listener_allowed() -> bool:
+    return WATCHDOG_TELEGRAM_BOT_TOKEN or ALLOW_SHARED_TOKEN_LISTENER
+
+
+def _get_status_by_key(statuses: list[dict[str, Any]], service_key: str) -> dict[str, Any] | None:
+    for item in statuses:
+        if item["key"] == service_key:
+            return item
+    return None
+
+
+def _can_use_watchdog_polling(statuses: list[dict[str, Any]]) -> bool:
+    if WATCHDOG_TELEGRAM_BOT_TOKEN:
+        return True
+    if not SHARED_TOKEN_MODE:
+        return True
+    ai_status = _get_status_by_key(statuses, MAIN_BOT_SERVICE_KEY)
+    return bool(ai_status and not ai_status["up"])
+
+
+def _get_newly_down_services(statuses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    newly_down: list[dict[str, Any]] = []
+    for item in statuses:
+        prev_up = _LAST_SERVICE_UP.get(item["key"])
+        if (prev_up is None or prev_up is True) and not item["up"]:
+            newly_down.append(item)
+        _LAST_SERVICE_UP[item["key"]] = bool(item["up"])
+    return newly_down
+
+
+def _get_newly_down_services(statuses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    newly_down: list[dict[str, Any]] = []
+    for item in statuses:
+        prev_up = _LAST_SERVICE_UP.get(item["key"])
+        if prev_up is True and not item["up"]:
+            newly_down.append(item)
+        elif prev_up is None and not item["up"]:
+            newly_down.append(item)
+        _LAST_SERVICE_UP[item["key"]] = bool(item["up"])
+    return newly_down
+
+
+def ask_and_wait(service: dict[str, Any]) -> bool:
+    if not BOT_TOKEN:
+        return False
+
+    key = service["key"]
+    name = service["name"]
+    text = f"Service is down\n\n{name}\n\nStart it now?"
+    keyboard = _build_raw_keyboard(
+        [
+            [("Yes, start", f"watchdog_yes:{key}"), ("Not now", f"watchdog_no:{key}")],
+        ]
+    )
+    tg_send(text, keyboard=keyboard)
+
+    updates = tg_get_updates(allowed_updates=["callback_query"])
+    offset = updates[-1]["update_id"] + 1 if updates else None
+    deadline = time.time() + APPROVAL_TIMEOUT
+    print(f"[watchdog] waiting for Telegram approval: {name}")
+
+    while time.time() < deadline:
+        for update in tg_get_updates(offset=offset, allowed_updates=["callback_query"]):
+            offset = update["update_id"] + 1
+            callback = update.get("callback_query") or {}
+            data = callback.get("data", "")
+            callback_id = callback.get("id", "")
+            if data == f"watchdog_yes:{key}" or data == f"systems_restart:{key}":
+                tg_answer_callback(callback_id, "starting")
+                return True
+            if data == f"watchdog_no:{key}" or data == f"systems_skip:{key}":
+                tg_answer_callback(callback_id, "skipping")
+                return False
+        time.sleep(2)
+
+    tg_send(f"No answer was received for {name}. No action was taken.")
+    return False
+
+
+def send_down_services_alert(statuses: list[dict[str, Any]]) -> None:
+    down = [item for item in statuses if not item["up"]]
+    newly_down = _get_newly_down_services(statuses)
+    if not down:
+        return
+    header = "Services Down"
+    tg_send(format_system_status_message(statuses, header=header), keyboard=_build_raw_keyboard(build_action_rows(statuses)))
+
+
+def run_check(silent_if_all_ok: bool = False, auto_restart: bool = False) -> list[dict[str, Any]]:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    print("=" * 48)
+    print(f"InnerBalance Watchdog - {now}")
+    print("=" * 48)
+
+    statuses = collect_service_statuses()
+    for item in statuses:
+        print(f"{_status_icon(item['up'])} {item['name']}")
+
+    down = [item for item in statuses if not item["up"]]
+    if not down:
+        print("All monitored services are up.")
+        if not silent_if_all_ok:
+            tg_send(format_system_status_message(statuses, header="✅ בדיקת שירותים"))
+        return statuses
+
+    print(f"Down services: {len(down)}")
+
+    if auto_restart:
+        print("Auto-restart mode enabled.")
+        for item in down:
+            service = SERVICE_MAP[item["key"]]
+            if not service.get("auto_restart", True):
+                print(f"Skipping on-demand service: {service['name']}")
+                continue
+            ok, message = restart_service(service, send_notifications=not silent_if_all_ok)
+            print(message)
+            time.sleep(2)
+        refreshed = collect_service_statuses()
+        remaining_down = [item for item in refreshed if not item["up"]]
+        if remaining_down and not silent_if_all_ok:
+            send_down_services_alert(refreshed)
+        return refreshed
+
+    if not _can_use_watchdog_polling(statuses):
+        print("AI bot is up; sending actionable alert without polling Telegram from watchdog.")
+        if newly_down:
+            send_down_services_alert(statuses)
+        return statuses
+
+    if newly_down:
+        for item in newly_down:
+            service = SERVICE_MAP[item["key"]]
+            if ask_and_wait(service):
+                restart_service(service)
+            time.sleep(2)
+    return statuses
+
+
+def _extract_actor_id(update: dict[str, Any]) -> int | None:
+    if "message" in update:
+        return update["message"].get("from", {}).get("id")
+    if "callback_query" in update:
+        return update["callback_query"].get("from", {}).get("id")
+    return None
+
+
+def _extract_chat_id(update: dict[str, Any]) -> int | None:
+    if "message" in update:
+        return update["message"].get("chat", {}).get("id")
+    if "callback_query" in update:
+        return update["callback_query"].get("message", {}).get("chat", {}).get("id")
+    return None
+
+
+def _handle_listener_message(update: dict[str, Any]) -> None:
+    message = update.get("message") or {}
+    chat_id = message.get("chat", {}).get("id")
+    text = (message.get("text") or "").strip()
+    if not chat_id or not text:
+        return
+
+    lowered = text.lower()
+    if lowered in {"/start", "/help"}:
+        tg_send(
+            "Watchdog Control\n\n/status - system status\n/systems - same as status\n/restart <service_key> - manual restart"
+        )
+        return
+    if lowered in {"/status", "/systems"}:
+        statuses = collect_service_statuses()
+        tg_send(format_system_status_message(statuses), keyboard=_build_raw_keyboard(build_action_rows(statuses)))
+        return
+    if lowered.startswith("/restart "):
+        service_key = text.split(None, 1)[1].strip()
+        ok, result = restart_service_by_key(service_key)
+        statuses = collect_service_statuses()
+        tg_send(result + "\n\n" + format_system_status_message(statuses), keyboard=_build_raw_keyboard(build_action_rows(statuses)))
+        return
+    tg_send("Unknown command. Try /status or /restart <service_key>")
+
+
+def _handle_listener_callback(update: dict[str, Any]) -> None:
+    callback = update.get("callback_query") or {}
+    callback_id = callback.get("id", "")
+    data = callback.get("data", "")
+    message = callback.get("message") or {}
+    chat_id = message.get("chat", {}).get("id")
+    message_id = message.get("message_id")
+
+    if data == "systems_refresh":
+        statuses = collect_service_statuses()
+        tg_answer_callback(callback_id, "מרענן")
+        if chat_id and message_id:
+            tg_edit(chat_id, message_id, format_system_status_message(statuses), keyboard=_build_raw_keyboard(build_action_rows(statuses)))
+        return
+
+    if data.startswith("systems_restart:"):
+        service_key = data.split(":", 1)[1]
+        tg_answer_callback(callback_id, "מרים")
+        ok, result = restart_service_by_key(service_key, send_notifications=False)
+        statuses = collect_service_statuses()
+        if chat_id and message_id:
+            text = result + "\n\n" + format_system_status_message(statuses)
+            tg_edit(chat_id, message_id, text, keyboard=_build_raw_keyboard(build_action_rows(statuses)))
+        elif not ok:
+            tg_send(result)
+        return
+
+    if data.startswith("watchdog_yes:"):
+        tg_answer_callback(callback_id, "ממתין ל-watchdog")
+        return
+    if data.startswith("watchdog_no:"):
+        tg_answer_callback(callback_id, "דולג")
+        return
+
+
+def run_listener() -> int:
+    if not BOT_TOKEN:
+        print("[watchdog] Missing Telegram token; cannot start listener.")
+        return 1
+    if SHARED_TOKEN_MODE and not _shared_listener_allowed():
+        print("[watchdog] Refusing to start listener with the main bot token. Configure WATCHDOG_TELEGRAM_BOT_TOKEN first.")
+        return 1
+
+    print("[watchdog] Telegram listener is running.")
+    updates = tg_get_updates(allowed_updates=["message", "callback_query"])
+    offset = updates[-1]["update_id"] + 1 if updates else None
+
+    while True:
+        for update in tg_get_updates(offset=offset, allowed_updates=["message", "callback_query"]):
+            offset = update["update_id"] + 1
+            actor_id = _extract_actor_id(update)
+            chat_id = _extract_chat_id(update)
+            if actor_id != ADMIN_ID and chat_id != ADMIN_ID:
+                continue
+            if "message" in update:
+                _handle_listener_message(update)
+            elif "callback_query" in update:
+                _handle_listener_callback(update)
+        time.sleep(LISTENER_POLL_SECONDS)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="InnerBalance Watchdog")
+    parser.add_argument("--loop", action="store_true", help="Run checks in a loop")
+    parser.add_argument("--listen", action="store_true", help="Run Telegram listener mode")
+    parser.add_argument("--interval", type=int, default=30, help="Minutes between checks in loop mode")
+    parser.add_argument("--quiet", action="store_true", help="Do not send Telegram if all services are up")
+    parser.add_argument("--auto-restart", action="store_true", help="Automatically restart all down services without approval")
+    parser.add_argument("--bootstrap-core", action="store_true", help="Launch the core desktop systems before running checks")
+    args = parser.parse_args()
+
+    if args.listen:
+        return run_listener()
+
+    if args.bootstrap_core:
+        print("[watchdog] Bootstrapping core systems.")
+        for message in bootstrap_core_systems():
+            print(message)
+
+    if args.loop:
+        print(f"[watchdog] loop mode every {args.interval} minutes")
+        while True:
+            run_check(silent_if_all_ok=True, auto_restart=args.auto_restart)
+            time.sleep(max(args.interval, 1) * 60)
+    else:
+        run_check(silent_if_all_ok=args.quiet, auto_restart=args.auto_restart)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
