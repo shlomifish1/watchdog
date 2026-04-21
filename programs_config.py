@@ -10,14 +10,31 @@ MARKETING_WORKFLOW_DIR = DESKTOP / "marketing_workflow_app"
 MEDIA_WORKFLOW_DIR = DESKTOP / "media_workflow_app"
 # PHASE 5: numerology lives here after extraction.
 NUMEROLOGY_DIR = DESKTOP / "numerology_app"
+FINANCE_WORKFLOW_DIR = DESKTOP / "finance_workflow_app"
 
 PROGRAMS = [
+    # Chrome with CDP (required for War Room / Mastermind Agent)
+    {
+        "name": "Chrome (CDP port 9222)",
+        "key": "chrome_cdp",
+        "check_type": "process",
+        "proc_name": "chrome",
+        "cmd_contains": "remote-debugging-port",
+        "cwd_contains": "",
+        "start_bat": str(AI_AGENTS_DIR / "start_chrome_cdp.bat"),
+        "start_cwd": str(AI_AGENTS_DIR),
+        "auto_restart": False,
+        "lazy": False,
+    },
     # Always on (auto-start at boot)
     {
         "name": "Web Server (InnerBalance)",
         "key": "web_server",
         "check_type": "url",
         "url": "http://127.0.0.1:8000/healthz",
+        "proc_name": "python",
+        "cmd_contains": "web_server.py",
+        "cwd_contains": "ai_agents",
         "start_bat": str(AI_AGENTS_DIR / "start_web_server_only.bat"),
         "start_cwd": str(AI_AGENTS_DIR),
         "auto_restart": True,
@@ -58,8 +75,8 @@ PROGRAMS = [
         "cwd_contains": "whatsapp_bot",
         "start_bat": str(AI_AGENTS_DIR / "whatsapp_bot" / "start_whatsapp_bot.bat"),
         "start_cwd": str(AI_AGENTS_DIR / "whatsapp_bot"),
-        "auto_restart": True,
-        "lazy": False,
+        "auto_restart": False,
+        "lazy": True,
         "kill_duplicates": False,
     },
     {
@@ -118,5 +135,18 @@ PROGRAMS = [
         "start_cwd": str(NUMEROLOGY_DIR),
         "auto_restart": False,
         "lazy": True,
+    },
+    {
+        "name": "Finance Workflow App",
+        "key": "finance_workflow",
+        "check_type": "url",
+        "url": "http://127.0.0.1:8400/finance/api/health",
+        "proc_name": "python",
+        "cmd_contains": "uvicorn",
+        "cwd_contains": "finance_workflow_app",
+        "start_bat": str(FINANCE_WORKFLOW_DIR / "start.bat"),
+        "start_cwd": str(FINANCE_WORKFLOW_DIR),
+        "auto_restart": True,
+        "lazy": False,
     },
 ]
