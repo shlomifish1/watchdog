@@ -23,13 +23,20 @@ def _norm(value: str | None) -> str:
     return (value or "").lower().replace("\\", "/")
 
 
+def _has_process_hints(program: dict) -> bool:
+    return any(
+        str(program.get(key, "")).strip()
+        for key in ("proc_name", "cmd_contains", "cwd_contains")
+    )
+
+
 def _find_matching_procs(program: dict) -> list[psutil.Process]:
     """Return all live processes that match the program's check criteria."""
     proc_name = _norm(program.get("proc_name", ""))
     cmd_contains = _norm(program.get("cmd_contains", ""))
     cwd_contains = _norm(program.get("cwd_contains", ""))
 
-    if program["check_type"] != "process":
+    if program["check_type"] != "process" and not _has_process_hints(program):
         return []
 
     matches: list[psutil.Process] = []
