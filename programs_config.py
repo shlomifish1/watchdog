@@ -2,15 +2,29 @@
 
 from pathlib import Path
 
-DESKTOP = Path("C:/Users/fishman-ai-server/Desktop")
-AI_AGENTS_DIR = DESKTOP / "ai_agents"
-DELIVERY_HSP_DIR = DESKTOP / "delivery_hsp"
-BOT_NEWS_DIR = DESKTOP / "bot_news"
-MARKETING_WORKFLOW_DIR = DESKTOP / "marketing_workflow_app"
-MEDIA_WORKFLOW_DIR = DESKTOP / "media_workflow_app"
+
+def _resolve_projects_root() -> Path:
+    """
+    Resolve a usable projects root on both server and development machines.
+    Priority:
+    1) Legacy server desktop path if it exists.
+    2) Parent folder of this watchdog directory.
+    """
+    legacy_server_root = Path("C:/Users/fishman-ai-server/Desktop")
+    if (legacy_server_root / "ai_agents").exists():
+        return legacy_server_root
+    return Path(__file__).resolve().parent.parent
+
+
+PROJECTS_ROOT = _resolve_projects_root()
+AI_AGENTS_DIR = PROJECTS_ROOT / "ai_agents"
+DELIVERY_HSP_DIR = PROJECTS_ROOT / "delivery_hsp"
+BOT_NEWS_DIR = PROJECTS_ROOT / "bot_news"
+MARKETING_WORKFLOW_DIR = PROJECTS_ROOT / "marketing_workflow_app"
+MEDIA_WORKFLOW_DIR = PROJECTS_ROOT / "media_workflow_app"
 # PHASE 5: numerology lives here after extraction.
-NUMEROLOGY_DIR = DESKTOP / "numerology_app"
-FINANCE_WORKFLOW_DIR = DESKTOP / "finance_workflow_app"
+NUMEROLOGY_DIR = PROJECTS_ROOT / "numerology_app"
+FINANCE_WORKFLOW_DIR = PROJECTS_ROOT / "finance_workflow_app"
 
 PROGRAMS = [
     # Chrome with CDP (required for War Room / Mastermind Agent)

@@ -2,9 +2,10 @@
 setlocal EnableExtensions EnableDelayedExpansion
 set PYTHONIOENCODING=utf-8
 chcp 65001 >nul 2>&1
-set PYTHON=C:\Users\fishman-ai-server\AppData\Local\Programs\Python\Python312\python.exe
-set SCRIPT=C:\Users\fishman-ai-server\Desktop\watchdog\watchdog.py
-set LOCKFILE=C:\Users\fishman-ai-server\Desktop\watchdog\locks\watchdog.lock
+cd /d "%~dp0"
+set PYTHON=python
+set SCRIPT=%~dp0watchdog.py
+set LOCKFILE=%~dp0locks\watchdog.lock
 
 :: Prevent duplicate watchdog instances via lock file
 if exist "%LOCKFILE%" (

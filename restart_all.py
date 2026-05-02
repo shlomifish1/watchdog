@@ -78,6 +78,30 @@ def _kill_all(program: dict) -> int:
     return killed
 
 
+def _format_mb(num_bytes: int) -> str:
+    mb = float(num_bytes or 0) / (1024 * 1024)
+    return f"{mb:.1f} MB"
+
+
+def _summarize_program_runtime(program: dict) -> dict[str, object]:
+    procs = _find_matching_procs(program)
+    pids = sorted({int(proc.pid) for proc in procs})
+    rss_total = 0
+    for proc in procs:
+        try:
+            rss_total += int(proc.memory_info().rss or 0)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+    return {
+        "name": str(program.get("name", program.get("key", "service"))),
+        "key": str(program.get("key", "")).strip(),
+        "running": bool(pids),
+        "pid_count": len(pids),
+        "pids": pids,
+        "rss_total": rss_total,
+    }
+
+
 def _start_program(program: dict) -> bool:
     name = program["name"]
     bat = Path(program["start_bat"])
@@ -112,13 +136,50 @@ def _start_program(program: dict) -> bool:
         return False
 
 
+def _parse_excluded_keys() -> set[str]:
+    raw = os.getenv("WATCHDOG_RESTART_EXCLUDE_KEYS", "")
+    if not raw.strip():
+        return set()
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+def _parse_included_keys() -> set[str]:
+    raw = os.getenv(
+        "WATCHDOG_RESTART_INCLUDE_KEYS",
+        "web_server,cloudflare,ai_agents_bot,whatsapp_bot",
+    )
+    if not raw.strip():
+        return set()
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
 def main() -> None:
     print("=" * 50)
     print("  restart_all.py — InnerBalance Service Restart")
     print("=" * 50)
 
+    included_keys = _parse_included_keys()
+    excluded_keys = _parse_excluded_keys()
+
+    programs = PROGRAMS
+    if included_keys:
+        programs = [
+            program for program in programs
+            if str(program.get("key", "")).strip().lower() in included_keys
+        ]
+    programs = [
+        program for program in programs
+        if str(program.get("key", "")).strip().lower() not in excluded_keys
+    ]
+
+    if included_keys:
+        print(f"Included service keys: {', '.join(sorted(included_keys))}")
+    if excluded_keys:
+        print(f"Excluded service keys: {', '.join(sorted(excluded_keys))}")
+    print(f"Programs to restart: {len(programs)}")
+
     started = 0
-    for program in PROGRAMS:
+    for program in programs:
         print(f"\n[{program['name']}]")
 
         # Kill all existing instances
@@ -129,11 +190,25 @@ def main() -> None:
     time.sleep(2)
 
     # Start each program fresh
-    for program in PROGRAMS:
+    for program in programs:
         print(f"\n[{program['name']}]")
         ok = _start_program(program)
         if ok:
             started += 1
+
+    print("\nWaiting 2 seconds for services to settle...")
+    time.sleep(2)
+
+    print("\nService runtime snapshot:")
+    print("-" * 50)
+    for program in programs:
+        summary = _summarize_program_runtime(program)
+        status = "RUNNING" if summary["running"] else "DOWN"
+        pids_text = ",".join(str(pid) for pid in summary["pids"]) if summary["pids"] else "-"
+        print(
+            f"{summary['name']} [{summary['key']}] | {status} | "
+            f"PIDs: {pids_text} | RAM: {_format_mb(int(summary['rss_total']))}"
+        )
 
     print("\n" + "=" * 50)
     print(f"  Restarted {started} programs")
